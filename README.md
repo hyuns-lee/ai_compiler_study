@@ -30,7 +30,7 @@
 ### 1.2. docker 사용
 - docker image
     ```shell
-    docker push hslee55/rope_triton:latest
+    docker push hslee55/rope_triton:v2
     ```
 - test file path
     - **/root/TransformerEngine/tests/pytorch/test_study.py**
