@@ -143,6 +143,7 @@ pytest test_study.py
 - `BLOCK_SIZE`는 `rope_fw`와 동일하게 `rotary_percent`가 반영된 `hidden_dim`으로 즉, `hidden_dim*rotary_percent`으로 설정하였음
 - Forward에서 `M_rot(emb) * input(t) = output` 을 통해서 rotation을 수행했고 backward에서는 `output_grad`를 입력으로 하여 `input_grad`를 구해야 하므로 M_rot<sup>-1</sup> * output_grad = input_grad를 연산해야 함
 - M_rot<sup>-1</sup> 은 반대 방향으로 rotation을 하면 되기 때문에 다음의 형태로 변환을 해준다
+
 $$
 M_{rot}^{-1} =
 \begin{pmatrix}
@@ -151,13 +152,9 @@ M_{rot}^{-1} =
 \end{pmatrix}
 $$
 
-| a_{1,1} & a_{1,2} & \cdots & a_{1,n} |  
-| a_{2,1} & a_{2,2} & \cdots & a_{2,n} |  
-| \vdots  & \vdots  & \ddots & \vdots  |  
-| a_{m,1} & a_{m,2} & \cdots & a_{m,n} |  
 
 
-- \vec{v} = \begin{bmatrix} X \\\ Y \end{bmatrix}
+- 
     ```python
     @triton.jit
     def rope_bw(t_ptr, emb_ptr, out_ptr, seq_length, batch_size, head_num, hidden_size, BLOCK_SIZE:tl.constexpr):
