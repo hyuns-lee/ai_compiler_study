@@ -10,6 +10,7 @@ from transformer_engine.pytorch.attention import (
 )
 import triton
 import triton.language as tl
+import time
 import inspect
 # print(inspect.getfile(RotaryPositionEmbedding))
 
@@ -88,6 +89,8 @@ def rope_bw(t_ptr, emb_ptr, out_ptr, seq_length, batch_size, head_num, hidden_si
     tl.store(out_ptr+t_right_offset, output, mask = maskr)
 
 
+
+
 class TritonRoPEFunc(torch.autograd.Function):
     """
     Function for FusedRoPE
@@ -105,8 +108,10 @@ class TritonRoPEFunc(torch.autograd.Function):
         tensor_format: str = "sbhd",
         cu_seqlens: Union[torch.Tensor, None] = None,
     ) -> torch.Tensor:
+        # output = t.clone().detach()
         if tensor_format == "sbhd":
             output = t.clone().detach()
+
             seq_length = t.size()[0]
             batch_size = t.size()[1]
             head_num = t.size()[2]
@@ -117,6 +122,7 @@ class TritonRoPEFunc(torch.autograd.Function):
         elif tensor_format == "bshd":
             t = t.transpose(0, 1).contiguous()
             output = t.clone().detach()
+
             seq_length = t.size()[0]
             batch_size = t.size()[1]
             head_num = t.size()[2]
@@ -143,6 +149,7 @@ class TritonRoPEFunc(torch.autograd.Function):
         ctx, grad_output: torch.Tensor
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         freqs, cu_seqlens = ctx.saved_tensors
+        # grad_input = grad_output.clone().detach()
         if ctx.tensor_format == "sbhd":
             grad_input = grad_output.clone().detach()
             seq_length = grad_output.size()[0]
@@ -216,20 +223,33 @@ def test_fused_rope(
     ## Test
     # unfused
     print("[TEST] apply_rotary_pos_emb unfused")
+    start = time.time()
     output_unfused = apply_rotary_pos_emb(
         t, emb, tensor_format=tensor_format, fused=False
     )
+    end = time.time()
+    t_fwd_unfused = end - start
     loss_unfused = loss_func(output_unfused)
+    start = time.time()
     loss_unfused.backward()
+    end = time.time()
+    t_bwd_unfused = end - start
     grad_unfused = t.grad.detach().clone()
     t.grad = None
+  
 
     print("[TEST] apply_rotary_pos_emb fused")
+    start = time.time()
     output_fused = apply_rotary_pos_emb(
         t, emb, tensor_format=tensor_format, fused=True
     )
+    end = time.time()
+    t_fwd_fused = end - start
     loss_fused = loss_func(output_fused)
+    start = time.time()
     loss_fused.backward()
+    end = time.time()
+    t_bwd_fused = end - start
     grad_fused = t.grad.detach().clone()
     t.grad = None
 
@@ -240,9 +260,16 @@ def test_fused_rope(
 
     # Triton
     print("[TEST] apply_rotary_pos_emb with triton")
+    start = time.time()
     out_triton = TritonRoPEFunc.apply(t, emb, tensor_format, None)
+    end = time.time()
+    t_fwd_triton = end - start
     loss_triton = loss_func(out_triton)
+    start = time.time()
     loss_triton.backward()
+    end = time.time()
+    t_bwd_triton = end - start
+
     grad_triton = t.grad.detach().clone()
     t.grad = None
 
@@ -252,6 +279,58 @@ def test_fused_rope(
     print("PASS")
     assert grad_triton.is_contiguous()
 
+    ## time.time is not correct for triton kernel
+    # print(f"[TEST] unfused: {t_fwd_unfused, t_bwd_unfused}\n\t fused: {t_fwd_fused, t_bwd_fused}\n\t triton: {t_fwd_triton, t_bwd_triton}")
+
+## Time profiling
+batch_size, seq_length, head_num, hidden_size, rotary_percent = 2, 4096, 64, 256, 0.5 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['mode'], 
+        x_vals=['forward', 'backward'],  
+        line_arg='provider',  
+        line_vals=['triton', 'torch', 'cuda'], 
+        line_names=["Triton", "Torch", "Cuda"],  
+        styles=[('blue', '-'), ('green', '-'), ('orange', '-')],  
+        ylabel="ms",  
+        plot_name="RoPE performance",  
+        args={"batch_size": batch_size, "head_num": head_num, "hidden_size": hidden_size, 
+            "rotary_percent": rotary_percent, "tensor_format": 'sbhd', "seq_length": seq_length},
+    ))
+def benchmark(batch_size, seq_length, head_num, hidden_size, provider, mode='forward', rotary_percent=1.0, tensor_format='sbhd'):
+    device = torch.device("cuda:0")
+    t = torch.rand((batch_size, seq_length, head_num, hidden_size), dtype=torch.float32, device=device)
+    quantiles = [0.5, 0.2, 0.8]
+    
+    if tensor_format == "bshd":
+        t = t.transpose(0, 1).contiguous()
+    if transpose:
+        t = t.transpose(*transpose).contiguous().transpose(*transpose)
+    t.requires_grad = True
+
+    rotary_pos_emb = RotaryPositionEmbedding(hidden_size, rotary_percent)
+    emb = rotary_pos_emb(seq_length)
+    
+    if provider == 'torch':
+        def fwd(t, emb, tensor_format):
+            return apply_rotary_pos_emb(t, emb, tensor_format=tensor_format, fused=False)
+    if provider == 'triton':
+        def fwd(t, emb, tensor_format):
+            return TritonRoPEFunc.apply(t, emb, tensor_format, None)
+    if provider == 'cuda':
+        def fwd(t, emb, tensor_format):
+            return apply_rotary_pos_emb(t, emb, tensor_format=tensor_format, fused=True)
+        
+    # forward pass
+    if mode == 'forward':       
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: fwd(t, emb, tensor_format), quantiles=quantiles)
+    if mode == 'backward':
+        y = fwd(t, emb, tensor_format)
+        dy = torch.randn_like(y)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True), quantiles=quantiles, grad_to_none=[t])
+
+    dur = lambda ms: ms
+    return dur(ms), dur(max_ms), dur(min_ms)
 
 if __name__=="__main__":
     dtype = torch.float16
@@ -264,3 +343,8 @@ if __name__=="__main__":
     loss_func = _overlapping_grad
 
     test_fused_rope(dtype, seq_length, hidden_size, rotary_percent, margin, transpose, tensor_format, loss_func)
+
+    # time profiling
+    benchmark.run(show_plots=False, print_data=True, save_path='.')
+        
+

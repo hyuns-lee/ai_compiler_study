@@ -90,7 +90,10 @@ pytest test_study.py
     ```
 
 ### 2.4. Profiling한 결과와 개선한 점에 대한 설명
-
+- forward, backward에 대해서 torch, cuda, triton이 실행되는 시간을 각각 구했고, 순서대로 다음과 같다
+- forward [ms]: 4.85, 1.68, 2.43
+- backward [ms]: 7.69, 1.68, 2.36
+- profiling 결과 triton을 사용한 경우가 torch만을 이용한 것보다는 빠르고, cuda로 최적화된 커널보다는 느리게 나오는 것을 확인했다. Triton에서도 보다 커널 안에서 데이터를 로드한 후 여러번 reuse를 하는 형식으로 개선을 해야 될 것 같다.
 ## 3. 코드 설명
 ### 3.1. TritonRoPEFunc
 - 주어진 `apply_rotary_pos_emb`가 `fused: True`인 경우 사용하는 torch의 autograd 기능을 동일하게 사용하기 위해 **transformer_engine/pytorch/attention.py**의 `FusedRoPEFunc` class를 참고하여 `TritonRoPEFunc`를 구현함
