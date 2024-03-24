@@ -40,6 +40,8 @@
 ```shell
 # Run the test code
 python test_study.py
+# pytest the code
+pytest test_study.py
 ```
 ### 2.1. [**이곳에 나오는 pytorch 함수**](https://github.com/NVIDIA/TransformerEngine/blob/b8eea8aaa94bb566c3a12384eda064bda8ac4fd7/transformer_engine/pytorch/attention.py#L1170-L1230)가 실행가능 한 코드
 - `test_study.py` 내부의 test_fused_rope 함수 안에 apply_rotary_pos_emb의 fused, unfused 실행이 가능한 코드가 있고 둘 사이의 결과가 같은 것을 확인함
@@ -88,3 +90,94 @@ python test_study.py
     ```
 
 ### 2.4. Profiling한 결과와 개선한 점에 대한 설명
+
+## 3. 코드 설명
+### 3.1. TritonRoPEFunc
+- 주어진 `apply_rotary_pos_emb`가 `fused: True`인 경우 사용하는 torch의 autograd 기능을 동일하게 사용하기 위해 **transformer_engine/pytorch/attention.py**의 `FusedRoPEFunc` class를 참고하여 `TritonRoPEFunc`를 구현함
+- `TritonRoPEFunc` class 내부에는 @staticmethod와 함께 forward, backward를 구현함
+- forward에서는 triton kernel인 rope_fw를 부르고, backward에서는 triton kernel인 rope_bw를 불러 각각의 기능을 수행함
+- tensor_format에 따라서 각각 맞는 형태로 변환하여 triton kernel을 부르고, 그 결과 나오는 출력도 맞는 형태로 변환하여 리턴해줌
+
+### 3.2. rope_fw
+- `BLOCK_SIZE`는 `rotary_percent`가 반영된 `hidden_dim`으로 즉, `hidden_dim*rotary_percent`으로 설정하였음
+    ```python
+    @triton.jit
+    def rope_fw(t_ptr, emb_ptr, out_ptr, seq_length, batch_size, head_num, hidden_size, BLOCK_SIZE:tl.constexpr):
+        # 1개의 program이 1개의 input row를 담당
+        pid = tl.program_id(axis=0)
+
+        # input t의 width가 hidden_size
+        t_start = pid * hidden_size
+
+        # emb는 pid가 batch_size*head_num 개 증가할 때마다 업데이트
+        # emb의 Width == BLOCK_SIZE
+        emb_start = pid//(batch_size*head_num) * BLOCK_SIZE
+
+        # 밑에서 한번에 사용할 input row의 폭이 BLOCK_SIZE//2 이므로 동일하게 emboffset도 BLOCK_SIZE//2만 load
+        # emb 연산 시 RotaryPositionEmbedding.forward에서 같은 freqs를 concat하므로 BLOCK_SIZE//2를 load하고 두번 반복해서 사용 가능
+        emboffset = emb_start + tl.arange(0, BLOCK_SIZE//2)
+        maskemb = emboffset < seq_length*BLOCK_SIZE
+        emb = tl.load(emb_ptr + emboffset, mask=maskemb)
+        cos_emb = tl.cos(emb)
+        sin_emb = tl.sin(emb)
+
+        # input t 에 대해서 left, right로 둘로 나누고, 각각에 대해서 cos_emb, sin_emb에 맞는 elemwise mult.를 해준다
+        t_left_offset = t_start + tl.arange(0, BLOCK_SIZE//2)
+        t_right_offset = t_start + tl.arange(0, BLOCK_SIZE//2) + BLOCK_SIZE//2
+
+        maskl = t_left_offset < seq_length*batch_size*head_num*hidden_size
+        t_left = tl.load(t_ptr + t_left_offset, mask=maskl)
+        maskr = t_right_offset < seq_length*batch_size*head_num*hidden_size
+        t_right = tl.load(t_ptr + t_right_offset, mask=maskr)
+
+        # output = ⌈cos_emb -sin_emb⌉ ⌈t_left ⌉
+        #          ⌊sin_emb cos_emb ⌋ ⌊t_right⌋
+        output = t_left * cos_emb - t_right * sin_emb
+        tl.store(out_ptr+t_left_offset, output, mask = maskl)
+
+        output =  t_left * sin_emb + t_right * cos_emb
+        tl.store(out_ptr+t_right_offset, output, mask = maskr)
+    ```
+
+### 3.3. rope_bw
+- `BLOCK_SIZE`는 `rope_fw`와 동일하게 `rotary_percent`가 반영된 `hidden_dim`으로 즉, `hidden_dim*rotary_percent`으로 설정하였음
+- Forward에서 `M_rot(emb) * input(t) = output` 을 통해서 rotation을 수행했고 backward에서는 `output_grad`를 입력으로 하여 `input_grad`를 구해야 하므로 M_rot<sup>-1</sup> * output_grad = input_grad를 연산해야 함
+- M_rot<sup>-1</sup> 은 반대 방향으로 rotation을 하면 되기 때문에 다음의 형태로 변환을 해준다
+$$
+M_{rot}^{-1} =
+\begin{pmatrix}
+\cos_{emb} & \sin_{emb} \\
+-\sin_{emb} & \cos_{emb}
+\end{pmatrix}$$
+
+- 
+    ```python
+    @triton.jit
+    def rope_bw(t_ptr, emb_ptr, out_ptr, seq_length, batch_size, head_num, hidden_size, BLOCK_SIZE:tl.constexpr):
+        pid = tl.program_id(axis=0)
+
+        t_start = pid * hidden_size
+        emb_start = pid//(batch_size*head_num) * BLOCK_SIZE
+
+        emboffset = emb_start + tl.arange(0, BLOCK_SIZE//2)
+        maskemb = emboffset < seq_length*BLOCK_SIZE
+        emb = tl.load(emb_ptr + emboffset, mask=maskemb)
+        cos_emb = tl.cos(emb)
+        sin_emb = tl.sin(emb)
+
+        t_left_offset = t_start + tl.arange(0, BLOCK_SIZE//2)
+        t_right_offset = t_start + tl.arange(0, BLOCK_SIZE//2) + BLOCK_SIZE//2
+
+        maskl = t_left_offset < seq_length*batch_size*head_num*hidden_size
+        t_left = tl.load(t_ptr + t_left_offset, mask=maskl)
+        maskr = t_right_offset < seq_length*batch_size*head_num*hidden_size
+        t_right = tl.load(t_ptr + t_right_offset, mask=maskr)
+
+        # output = ⌈cos_emb  sin_emb⌉ ⌈t_left ⌉
+        #          ⌊-sin_emb cos_emb⌋ ⌊t_right⌋
+        output = t_left * cos_emb + t_right * sin_emb
+        tl.store(out_ptr+t_left_offset, output, mask = maskl)
+
+        output =  -t_left * sin_emb + t_right * cos_emb
+        tl.store(out_ptr+t_right_offset, output, mask = maskr)
+    ```
